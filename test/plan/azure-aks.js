@@ -1,10 +1,9 @@
 const assert = require('yeoman-assert');
 const genSpec = require('../helpers/geneteratorSpecificationHelper');
 
-describe('cloudcommons/cli:azure-aks', function () {    
+describe('cloudcommons/cli:azure-aks', function () {
     describe('Terraform plan validations', function () {
-        describe('Creates an AKS with Application Insights with log analytics', function () {    
-                    
+        describe('Creates an AKS with Application Insights with log analytics', function () {
             var spec = {
                 config: {
                     terraform: {
@@ -57,20 +56,22 @@ describe('cloudcommons/cli:azure-aks', function () {
                 }
             };
 
-            var plan = null;
+            var helper = null;
 
             before(done => {
                 genSpec(spec, (terraformPlan) => {
-                    plan = terraformPlan;
+                    helper = getTestHelper(spec, terraformPlan);
                     done();
                 });
             });
 
             it('Generates a valid plan', () => {
+                var plan = helper.plan;
                 assert.ok(plan);
             });
 
             it('Plans to create all the variables', () => {
+                var plan = helper.plan;
                 plan.variables('ADMIN_USER').is(spec.generators['azure-aks'].prompts.adminUser);
                 plan.variables('APP').is(spec.generators['terraform'].prompts.app);
                 plan.variables('AUTO_SCALING_ENABLED').is(false);
@@ -96,7 +97,8 @@ describe('cloudcommons/cli:azure-aks', function () {
                 plan.variables('VNET_SERVICE_CIDR').is('172.0.2.0/23');
             });
 
-            it('Plans the right output variables', () => {                
+            it('Plans the right output variables', () => {
+                var plan = helper.plan;
                 plan.planned_values.outputs("AKS_KUBE_CONFIG").isSensitive();
                 plan.planned_values.outputs("AKS_KUBE_CONFIG_RAW").isSensitive();
                 plan.planned_values.outputs("LOG_ANALYTICS_ID").isNotSensitive();
@@ -107,9 +109,11 @@ describe('cloudcommons/cli:azure-aks', function () {
                 plan.planned_values.outputs("RESOURCE_GROUP_ID").isNotSensitive();
             });
 
-            it(`Plans the creation of the resource group`, () => {
-                var prompts = spec.generators['azure-resource-group'].prompts;
-                var resourceGroup = plan.planned_values.root_module.resources(`azurerm_resource_group.${prompts.name}`);
+            it(`Plans resource group`, () => {
+                var ctx = helper.getResourceGroup();
+                var prompts = ctx.prompts;
+                var resourceGroup = ctx.resource;
+
                 resourceGroup.mode().is("managed")
                     .type().is("azurerm_resource_group")
                     .name().is(prompts.name)
@@ -117,21 +121,109 @@ describe('cloudcommons/cli:azure-aks', function () {
                     .value("location").is(prompts.location);
             });
 
-            it(`Plans the creation of an AKS cluster`, () => {
-                var prompts = spec.generators['azure-aks'].prompts;
-                var aks = plan.planned_values.root_module
-                    .child_modules(`module.${prompts.name}-kubernetes`)
-                    .resources(`module.${prompts.name}-kubernetes.azurerm_kubernetes_cluster.cloudcommons`);
-                aks.name().is('cloudcommons')
-                   .type().is('azurerm_kubernetes_cluster')
-                   .mode().is('managed')
-                   .providerName().is('azurerm');
-                
-                var nodePool = aks.value('default_node_pool').get()[0];
-                assert.equal(nodePool.vm_size, prompts.vmsize);
+            it(`Plans a managed AKS azurerm_kubernetes_cluster`, () => {
+                var ctx = helper.getAks();
+                var resource = ctx.aks.resource;
+                resource.name().is('cloudcommons')
+                    .type().is('azurerm_kubernetes_cluster')
+                    .mode().is('managed')
+                    .providerName().is('azurerm');
+            });
+
+            it('Plans the right node_pool configuration', () => {
+                var ctx = helper.getAks();
+                var nodePool = ctx.aks.default_node_pool();
+                assert.equal(nodePool.vm_size, ctx.prompts.vmsize);
                 assert.equal(nodePool.os_disk_size_gb, 60);
-                assert.equal(nodePool.max_pods, prompts.podsPerNode);                
+                assert.equal(nodePool.max_pods, ctx.prompts.podsPerNode);
+            });
+
+            it('Disables the Kubernetes dashboard by default', () => {
+                var ctx = helper.getAks();
+                var addon_profile = ctx.aks.addon_profile(0);
+                assert.ok(addon_profile.kube_dashboard, `No kube_dashboard configuration found`);
+                assert.equal(addon_profile.kube_dashboard[0].enabled, false, `Kube dashboard expected value: ${false}. Actual: ${addon_profile.kube_dashboard[0].enabled}`);
+            });
+
+            it('Plans Azure Log', () => {
+                var ctx = helper.getLogAnalytics();
+                var prompts = ctx.prompts;
+                var logAnalytics = ctx.resource;
+                logAnalytics.name().is(`${prompts.name}`)
+                    .mode().is('managed')
+                    .type().is('azurerm_log_analytics_workspace')
+                    .providerName().is('azurerm');
+
+                logAnalytics.value('location').is(prompts.location)
+                    .value('retention_in_days').is(prompts.retention)
+                    .value('sku').is('PerGB2018')
+                    .value('timeouts').is(null);
+            });
+
+            it('Plans Random Id', () => {
+                var random = helper.getRandomId().resource;
+                random.name().is('cloudcommons')
+                    .mode().is('managed')
+                    .type().is('random_id')
+                    .providerName().is('random');
+
+                random.value('byte_length').is(4);
             });
         });
     });
 });
+
+/**
+ * This helper function returns an object to simplify the access to the plan assert
+ * @param {*} spec 
+ * @param {*} plan 
+ */
+function getTestHelper(spec, plan) {
+    return {
+        plan: plan,
+        getAks: function () {
+            var prompts = spec.generators['azure-aks'].prompts;
+            var module = this.plan.planned_values.root_module
+                .child_modules(`module.${prompts.name}-kubernetes`);
+            var aksResource = module.resources(`module.${prompts.name}-kubernetes.azurerm_kubernetes_cluster.cloudcommons`);
+            return {
+                prompts: prompts,
+                aks: {
+                    module: module,
+                    resource: aksResource,
+                    getArrayValue(name, index) {
+                        var array = aksResource.value(name).get();
+                        assert.notEqual(array.length, 0, `No ${name} found`);
+                        assert.ok(array.length > index, `${name} out of range`);
+                        return array[index];
+                    },
+                    addon_profile(index = 0) {
+                        return this.getArrayValue('addon_profile', index);
+                    },
+                    default_node_pool(index = 0) {
+                        return this.getArrayValue('default_node_pool', index);
+                    }
+                }
+            }
+        },
+        getLogAnalytics: function () {
+            var prompts = spec.generators['azure-log-analytics'].prompts;
+            return {
+                prompts: prompts,
+                resource: this.plan.planned_values.root_module.resources(`azurerm_log_analytics_workspace.${prompts.name}`)
+            }
+        },
+        getRandomId: function () {
+            return {
+                resource: this.plan.planned_values.root_module.resources('random_id.cloudcommons')
+            }
+        },
+        getResourceGroup: function () {
+            var prompts = spec.generators['azure-resource-group'].prompts;
+            return {
+                prompts: prompts,
+                resource: this.plan.planned_values.root_module.resources(`azurerm_resource_group.${prompts.name}`)
+            }
+        }
+    }
+}
